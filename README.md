@@ -1,182 +1,143 @@
-# CST8916 – Assignment 2: Real-time Stream Analytics Pipeline
+# Algonquin Pet Store (On Steroids) — Lab 8 Deployment
 
-> **AI Assistance Disclosure:** This project was developed with the assistance of Claude (Anthropic).
-> All code has been reviewed and understood by the author.
+## CST8915 — Full Stack Cloud Development
+
+**Student:** Muhannad J  
+**Course:** CST8915 — Winter 2026  
+**Professor:** Ramy Mohamed
+
+---
 
 ## Demo Video
 
-[Watch the demo on YouTube](https://youtu.be/t-ED5jEDGZY)
+[![Watch the Demo](https://img.shields.io/badge/YouTube-Demo_Video-red?style=for-the-badge&logo=youtube)](https://youtu.be/MWMXBwMM1lE)
 
 ---
 
-## Architecture Diagram
+## Overview
+
+This lab demonstrates the deployment of **Algonquin Pet Store (On Steroids)** — a microservices-based e-commerce application — to **Azure Kubernetes Service (AKS)**. The app showcases a polyglot architecture, event-driven design, and common open-source backend services.
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Azure App Service                               │
-│                                                                          │
-│   Browser                                                                │
-│   ┌──────────┐  POST /track   ┌──────────────────────────────────────┐  │
-│   │  Demo    │ ─────────────► │           app.py (Flask)             │  │
-│   │  Store   │                │                                      │  │
-│   │client.html│               │  parse_user_agent(User-Agent header) │  │
-│   └──────────┘                │  → adds deviceType, browser, os      │  │
-│                               └─────────────┬────────────────────────┘  │
-│                                             │ send_to_event_hubs()       │
-└─────────────────────────────────────────────┼────────────────────────────┘
-                                              │
-                    ┌─────────────────────────▼──────────────────────────┐
-                    │              Azure Event Hubs Namespace             │
-                    │                                                     │
-                    │   Hub: "clickstream"  (raw enriched events)        │
-                    │   Hub: "analytics-output" (ASA results)            │
-                    └────────────┬──────────────────────┬────────────────┘
-                                 │ input                │ output
-                    ┌────────────▼──────────────────────▼────────────────┐
-                    │           Azure Stream Analytics Job                │
-                    │                                                     │
-                    │  Q1 – Device Breakdown  (TumblingWindow 1 min)     │
-                    │       GROUP BY deviceType → event_count             │
-                    │                                                     │
-                    │  Q2 – Spike Detection   (TumblingWindow 1 min)     │
-                    │       COUNT(*) > 10 threshold → is_spike flag       │
-                    └─────────────────────────────────────────────────────┘
-                                              │
-                    ┌─────────────────────────▼──────────────────────────┐
-                    │                  app.py (Flask)                     │
-                    │                                                     │
-                    │  start_analytics_consumer() reads analytics-output  │
-                    │  stores results in _analytics_buffer (in-memory)   │
-                    │  GET /api/analytics serves buffer as JSON           │
-                    └─────────────────────────┬──────────────────────────┘
-                                              │ poll every 5s
-                    ┌─────────────────────────▼──────────────────────────┐
-                    │           dashboard.html (browser)                  │
-                    │                                                     │
-                    │  • Bar chart: device type breakdown (Chart.js)     │
-                    │  • Spike timeline: per-minute event counts          │
-                    │  • Raw event table with deviceType, browser, os    │
-                    └─────────────────────────────────────────────────────┘
+                         ┌──────────────┐
+                    ┌───▸│ order-service │───────┐
+                    │    │   (Node.js)   │       │
+┌───────────┐       │    └──────────────┘       ▼
+│ store-front│───────┤                     ┌───────────┐
+│  (Vue.js)  │       │    ┌──────────────┐ │order queue│
+└───────────┘       ├───▸│product-service│ │(RabbitMQ) │
+                    │    │    (Rust)     │ └─────┬─────┘
+                    │    └──────────────┘       │
+                    │                           ▼
+┌───────────┐       │    ┌────────────────┐  ┌──────────┐
+│store-admin │───────┘───▸│makeline-service│─▸│ MongoDB  │
+│  (Vue.js)  │            │     (Go)       │  │(Database)│
+└───────────┘            └───────┬────────┘  └──────────┘
+                                 │
+                          ┌──────▼──────┐
+                          │ ai-service  │──▸ OpenAI (GPT-4 + DALL·E)
+                          │  (Python)   │
+                          └─────────────┘
 ```
 
----
+## Services
 
-## Design Decisions
+| Service | Description | Technology |
+|---------|-------------|------------|
+| **store-front** | Customer-facing web app for browsing and ordering | Vue.js |
+| **store-admin** | Employee dashboard for managing orders and products | Vue.js |
+| **order-service** | Handles order placement | Node.js |
+| **product-service** | CRUD operations for products | Rust |
+| **makeline-service** | Processes orders from the queue | Go |
+| **ai-service** | Generates product descriptions and images (optional) | Python |
+| **rabbitmq** | Message queue for order processing | RabbitMQ |
+| **mongodb** | Persistent data storage | MongoDB |
+| **virtual-customer** | Simulates customer order creation | Rust |
+| **virtual-worker** | Simulates order completion | Rust |
 
-### Part 1 – Event Payload Enrichment
+## Deployment Steps
 
-**Approach:** Server-side User-Agent parsing in `app.py` using Python's built-in `re` module.
+### Prerequisites
 
-When the browser sends a `POST /track` request, the server reads the `User-Agent` HTTP header and runs regex patterns to extract:
-- `deviceType` — `"desktop"`, `"mobile"`, or `"tablet"`
-- `browser` — `"Chrome"`, `"Firefox"`, `"Safari"`, `"Edge"`, `"Opera"`, or `"Unknown"`
-- `os` — `"Windows"`, `"macOS"`, `"Linux"`, `"Android"`, `"iOS"`, or `"Unknown"`
+- Azure CLI installed and configured
+- `kubectl` installed
+- An active Azure subscription
 
-**Why server-side?** The browser cannot reliably report its own device type. Doing it on the server keeps the client code simple and ensures every event has these fields regardless of which page generated it.
-
-**Why no external library?** A simple regex approach avoids adding a dependency (`ua-parser2` etc.) and is sufficient for the three fields required by the assignment.
-
-### Part 2 – Connecting Stream Analytics to the Dashboard
-
-**Approach:** Stream Analytics → second Event Hub (`analytics-output`) → Flask background thread → in-memory buffer → `/api/analytics` HTTP endpoint → dashboard polls every 5 seconds.
-
-**Why a second Event Hub?** Stream Analytics supports Event Hub as a native output sink with no extra configuration. The alternative (Azure SQL or Blob Storage) would require additional Azure resources, extra SDK dependencies, and more complex polling logic.
-
-**Why poll instead of WebSocket push?** The existing lab dashboard already uses HTTP polling for raw events (`/api/events`). Reusing the same pattern for analytics keeps the architecture consistent and simple to understand and debug.
-
-**Why in-memory buffer?** For a course assignment with a short demo window, an in-memory dictionary is sufficient. In a production system this would be replaced with a database query.
-
-### Stream Analytics Query Design
-
-**Window type:** Tumbling window (non-overlapping, fixed-size). Chosen because:
-- Device breakdown needs a clean "count per minute" with no double-counting
-- Spike detection needs a discrete yes/no per window — overlapping windows would produce noisy results
-
-**Window size:** 1 minute — short enough to see changes quickly during a live demo, large enough to accumulate meaningful counts.
-
-**Spike threshold:** 10 events/minute — chosen to be easily triggerable during a demo by clicking around the store.
-
----
-
-## Azure Resources Required
-
-| Resource | Purpose |
-|---|---|
-| Azure Event Hubs Namespace | Hosts both event hubs |
-| Event Hub: `clickstream` | Receives enriched click events from the store |
-| Event Hub: `analytics-output` | Receives Stream Analytics query results |
-| Azure Stream Analytics Job | Runs Q1 and Q2 queries |
-| Azure App Service (Linux, Python 3.11) | Hosts the Flask app |
-
----
-
-## Setup Instructions
-
-### 1. Clone the repository
+### 1. Login to Azure
 
 ```bash
-git clone https://github.com/muhannadj27/CST8916_Assignment2.git
-cd CST8916_Assignment2
+az login
 ```
 
-### 2. Create Azure Event Hubs
-
-1. In the Azure Portal, create an **Event Hubs Namespace**
-2. Inside it, create two Event Hubs:
-   - `clickstream` (for raw events)
-   - `analytics-output` (for Stream Analytics output)
-3. Go to **Shared access policies → RootManageSharedAccessKey** and copy the connection string
-
-### 3. Create Azure Stream Analytics Job
-
-1. Create a new Stream Analytics Job in Azure Portal
-2. Add input: Event Hub `clickstream` → alias `clickstream-input`
-3. Add output: Event Hub `analytics-output` → alias `analytics-output`
-4. Paste the queries from `stream-analytics/queries.saql` into the query editor
-5. Start the job
-
-### 4. Configure environment variables
+### 2. Create Resource Group
 
 ```bash
-cp .env.example .env
-# Edit .env and fill in your connection string
+az group create --name myPetStoreRG --location westus3
 ```
 
-For Azure App Service, set these under **Settings → Configuration → Application settings**:
-- `EVENT_HUB_CONNECTION_STR` — your namespace connection string
-- `EVENT_HUB_NAME` — `clickstream`
-- `ANALYTICS_HUB_NAME` — `analytics-output`
-
-### 5. Run locally
+### 3. Create AKS Cluster
 
 ```bash
-pip install -r requirements.txt
-python app.py
+az aks create \
+  --resource-group myPetStoreRG \
+  --name myPetStoreAKS \
+  --node-count 2 \
+  --generate-ssh-keys \
+  --location westus3 \
+  --node-vm-size Standard_B2s_v2
 ```
 
-Visit `http://localhost:8000` for the store and `http://localhost:8000/dashboard` for the dashboard.
+> **Note:** The default `Standard_DS2_v2` VM size is not available on Azure for Students subscriptions in `westus3`. Using `Standard_B2s_v2` as an alternative.
 
-### 6. Deploy to Azure App Service
+### 4. Connect to the Cluster
 
-The repo includes a GitHub Actions workflow (`.github/workflows/`) for automatic deployment. Push to `main` to trigger a deploy.
-
-Alternatively, deploy via Azure CLI:
 ```bash
-az webapp up --name YOUR_APP_NAME --resource-group YOUR_RG --runtime "PYTHON:3.11"
+az aks get-credentials --resource-group myPetStoreRG --name myPetStoreAKS
+kubectl get nodes
 ```
 
----
+### 5. Deploy the Application
 
-## File Structure
+```bash
+cd "Deployment Files"
+kubectl apply -f secrets.yaml
+kubectl apply -f config-maps.yaml
+kubectl apply -f aps-all-in-one.yaml
+kubectl apply -f admin-tasks.yaml
+```
 
+### 6. Verify Deployment
+
+```bash
+kubectl get pods
+kubectl get services
 ```
-CST8916_Assignment2/
-├── app.py                        # Flask app (producer + consumer + analytics)
-├── requirements.txt              # Python dependencies
-├── .env.example                  # Environment variable template
-├── templates/
-│   ├── client.html               # Demo store (unchanged from lab)
-│   └── dashboard.html            # Analytics dashboard (upgraded)
-└── stream-analytics/
-    └── queries.saql              # Stream Analytics SAQL queries (Q1 + Q2)
+
+## Accessing the Application
+
+| App | URL | Type |
+|-----|-----|------|
+| **Store Front** | `http://<STORE_FRONT_EXTERNAL_IP>` | Customer-facing shop |
+| **Store Admin** | `http://<STORE_ADMIN_EXTERNAL_IP>` | Employee admin dashboard |
+
+External IPs are assigned automatically via Azure Load Balancer.
+
+## Challenges Encountered
+
+- **VM Size Restriction:** The default `Standard_DS2_v2` is not permitted on Azure for Students in `westus3`. Resolved by specifying `Standard_B2s_v2`.
+- **AI Service:** The `ai-service` pod shows `CreateContainerConfigError` without a valid OpenAI API key in `secrets.yaml`. The rest of the application functions fully without it.
+
+## Cleanup
+
+To avoid ongoing Azure charges, delete all resources when done:
+
+```bash
+az group delete --name myPetStoreRG --yes --no-wait
 ```
+
+## Acknowledgments
+
+- Original application inspired by the [AKS Store Demo](https://github.com/Azure-Samples/aks-store-demo)
+- Instructor: Ramy Mohamed — Algonquin College
